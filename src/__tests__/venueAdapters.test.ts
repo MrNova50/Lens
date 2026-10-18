@@ -5,6 +5,7 @@ import {
   ammAdapter,
   soroswapAdapter,
   aquariusAdapter,
+  phoenixAdapter,
   startVenueAdapter,
   startAllVenueAdapters,
   writeVenuePricePoints,
@@ -37,7 +38,11 @@ describe('VenueAdapter Interface and Runner (#218)', () => {
     expect(venueAdapters).toContain(ammAdapter)
     expect(venueAdapters).toContain(soroswapAdapter)
     expect(venueAdapters).toContain(aquariusAdapter)
-    expect(venueAdapters.length).toBe(4)
+    // Registration is what makes index.ts start one Phoenix instance per entry
+    // in ENABLED_NETWORKS, each writing the network it read from — no runner
+    // changes needed for a new venue.
+    expect(venueAdapters).toContain(phoenixAdapter)
+    expect(venueAdapters.length).toBe(5)
   })
 
   it('ensures each adapter implements the VenueAdapter contract', () => {
@@ -59,6 +64,8 @@ describe('VenueAdapter Interface and Runner (#218)', () => {
     expect(ammAdapter.source).toBe('AMM')
     expect(soroswapAdapter.source).toBe('soroswap_amm')
     expect(aquariusAdapter.source).toBe('aquarius_amm')
+    expect(phoenixAdapter.source).toBe('phoenix_amm')
+    expect(phoenixAdapter.name).toBe('Phoenix')
   })
 
   it('manages last-price tracking with network and pairKey isolation in runner', () => {
