@@ -1,0 +1,4065 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Lens API",
+    "description": "Unified Stellar price API aggregating SDEX + AMM prices.\nCache policy: every route sends a deliberate `Cache-Control` response header. Live prices (`/price/*`) are `public, max-age=30`; aggregates (`/price/*/history`, `/price/twap/*`, `/price/vwap/*`, `/prices/history`, `/compare/*`, `/spreads/*`) are `public, max-age=60`; slower-moving views (`/volumes/*`, `/screener`, `/basket`) are `public, max-age=120`; reference data that changes rarely (`/pairs`, `/pools`, `/benchmark/*`) is `public, max-age=300`; the discovery document is `public, max-age=3600`. `/candles` for a closed historical window (its `to` at least one full interval in the past) is *probably* immutable — backfill can rewrite history — so it is `public, max-age=3600, stale-while-revalidate=86400`; the still-forming window is `public, max-age=60`. Every `public` response also sends `Vary: x-network`, because the Stellar network can come from the `x-network` header (not part of the URL cache key). Routes behind the x402 payment gate use `private` instead of `public` when x402 is configured, so a shared cache never serves paid content for free. Per-caller responses (`/usage/me`), operator routes (`/admin/*`), mutations and error responses are `no-store` and must never sit in a shared cache.\nData Quality Guarantees: see `docs/data-quality.md` for explicit SLAs and guarantees on freshness (e.g. 300s staleness bound), completeness, precision (PostgreSQL Decimal(36,18) and negotiated string serialization), and multi-venue coverage across SDEX, Stellar AMM, Soroswap, and Aquarius.",
+    "version": "0.1.0",
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4000",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/venues/registry": {
+      "get": {
+        "operationId": "getVenueRegistry",
+        "summary": "List registered venues and their network liveness",
+        "description": "Returns each registered venue adapter for the selected network. Liveness is based on recent price writes where available; on-demand adapters without persisted price points report unknown.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registered venues and their current liveness",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "network",
+                    "venues"
+                  ],
+                  "properties": {
+                    "network": {
+                      "type": "string",
+                      "enum": [
+                        "testnet",
+                        "mainnet"
+                      ]
+                    },
+                    "venues": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "kind",
+                          "network",
+                          "enabled",
+                          "liveness",
+                          "lastSeenAt"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "orderbook",
+                              "amm",
+                              "oracle"
+                            ]
+                          },
+                          "network": {
+                            "type": "string",
+                            "enum": [
+                              "testnet",
+                              "mainnet"
+                            ]
+                          },
+                          "enabled": {
+                            "type": "boolean"
+                          },
+                          "liveness": {
+                            "type": "string",
+                            "enum": [
+                              "live",
+                              "stale",
+                              "disabled",
+                              "unknown"
+                            ]
+                          },
+                          "lastSeenAt": {
+                            "type": "string",
+                            "format": "date-time",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/live": {
+      "get": {
+        "operationId": "getLive",
+        "summary": "Liveness probe",
+        "description": "Reports whether this process is wedged and needs to be restarted. It checks no dependencies by design: a process that cannot reach Postgres is still healthy and should keep running, so failing liveness during a database outage would restart every instance at once. Use `/ready` to decide whether to send traffic.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Process is alive.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "ok",
+                    "uptimeSeconds"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "example": true
+                    },
+                    "uptimeSeconds": {
+                      "type": "integer",
+                      "description": "Seconds since the process started.",
+                      "example": 3600
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "operationId": "getReady",
+        "summary": "Readiness probe",
+        "description": "Reports whether this process should receive traffic yet. Unhealthy until the boot sequence finishes — the server starts listening before the ingesters and background workers are running — and while Postgres is unreachable or unmigrated, or Redis is unreachable when Redis is part of readiness (`READINESS_REDIS_CHECK`, default true).\nA probe timeout is reported as `down`, and answers are cached briefly, so this is cheap to poll every few seconds. `/live` stays healthy throughout: a starting instance should be held out of rotation, not killed.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Ready to receive traffic.",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready. `ok` is false and `checks` says which dependency (or the boot sequence) is responsible. `/live` remains healthy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessReport"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Get API status and indexer state",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "API status",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "network": {
+                      "type": "string",
+                      "enum": [
+                        "testnet",
+                        "mainnet"
+                      ]
+                    },
+                    "watchedPairs": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "lastIndexedLedger": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "lastProcessedAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "nullable": true
+                    },
+                    "ingestLagSeconds": {
+                      "type": "integer",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/snapshot": {
+      "get": {
+        "operationId": "getSnapshot",
+        "summary": "Whole-network snapshot (venues, TVL, 24h volume, top pairs, pegs, freshness)",
+        "description": "A single timestamped summary of one network: every venue's liveness, AMM pool reserves (TVL), 24h traded volume, the busiest pairs, stablecoin peg readings and how fresh the underlying data is. All figures are read in one consistent database statement, so `asOf` is a real instant and every age is measured from it. Missing data is reported as `null` with a reason (or an empty list), never invented — a cross-pair volume total is only returned when the pairs share one unit. Responses are cached briefly per network; `cache.ageSeconds` states the age of a served copy.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Network snapshot",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Freshness/brief-caching policy for the snapshot."
+              },
+              "X-Cache": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "HIT",
+                    "MISS"
+                  ]
+                },
+                "description": "Whether this response came from the short-lived cache."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/price/{assetA}/{assetB}": {
+      "get": {
+        "operationId": "getPrice",
+        "summary": "Get aggregated price for a pair",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM"
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "USDC"
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated price data",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AggregatedPrice"
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "404": {
+            "description": "Pair not watched"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/price/{assetA}/{assetB}/route": {
+      "get": {
+        "operationId": "getBestRoute",
+        "summary": "Get best swap route for a pair and amount",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "amount",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 1000
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Best route information",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteInfo"
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/price/{assetA}/{assetB}/history": {
+      "get": {
+        "operationId": "getPriceHistory",
+        "summary": "Get price history buckets",
+        "security": [],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1m",
+                "5m",
+                "1h",
+                "24h"
+              ],
+              "default": "1h"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 1000
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Price history",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pairKey": {
+                      "type": "string"
+                    },
+                    "network": {
+                      "type": "string",
+                      "enum": [
+                        "testnet",
+                        "mainnet"
+                      ]
+                    },
+                    "window": {
+                      "type": "string"
+                    },
+                    "buckets": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PriceBucket"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/pools": {
+      "get": {
+        "operationId": "getPools",
+        "summary": "Get AMM liquidity pool reserves and spot prices",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of pools",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pools": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "pool_id": {
+                            "type": "string"
+                          },
+                          "asset_a": {
+                            "type": "string"
+                          },
+                          "asset_b": {
+                            "type": "string"
+                          },
+                          "reserve_a": {
+                            "type": "number"
+                          },
+                          "reserve_b": {
+                            "type": "number"
+                          },
+                          "spot_price": {
+                            "type": "number"
+                          },
+                          "fee_bp": {
+                            "type": "integer"
+                          },
+                          "timestamp": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/candles/{assetA}/{assetB}": {
+      "get": {
+        "operationId": "getCandles",
+        "summary": "Get OHLCV candle data",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1m",
+                "5m",
+                "15m",
+                "1h",
+                "4h",
+                "1d"
+              ],
+              "default": "1h"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Candle data",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pairKey": {
+                      "type": "string"
+                    },
+                    "interval": {
+                      "type": "string"
+                    },
+                    "from": {
+                      "type": "string"
+                    },
+                    "to": {
+                      "type": "string"
+                    },
+                    "candles": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "time": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "open": {
+                            "type": "number"
+                          },
+                          "high": {
+                            "type": "number"
+                          },
+                          "low": {
+                            "type": "number"
+                          },
+                          "close": {
+                            "type": "number"
+                          },
+                          "volume": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/prices/history": {
+      "get": {
+        "operationId": "getPriceSnapshots",
+        "summary": "Get historical 1-minute price snapshots",
+        "description": "Returns minute-resolution price snapshots for a pair over [from, to], optionally aggregated into 5m or 1h buckets. Snapshots are retained for ~30 days. Gated by x402 (matches the /price prefix).",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "pair",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM/USDC"
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1m",
+                "5m",
+                "1h"
+              ],
+              "default": "1m"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "description": "Response encoding. `csv` returns a text/csv body holding a `ts,price,volume` table (RFC 4180 quoting, LF line endings, one trailing newline); `json` is the default.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "csv"
+              ],
+              "default": "json"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical price snapshots",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "example": "ts,price,volume\n2025-01-01T00:00:00.000Z,1.25,500\n"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pair": {
+                      "type": "string"
+                    },
+                    "network": {
+                      "type": "string",
+                      "enum": [
+                        "testnet",
+                        "mainnet"
+                      ]
+                    },
+                    "interval": {
+                      "type": "string"
+                    },
+                    "from": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "to": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "count": {
+                      "type": "integer"
+                    },
+                    "points": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "ts": {
+                            "type": "string",
+                            "format": "date-time"
+                          },
+                          "price": {
+                            "type": "number"
+                          },
+                          "volume": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/pairs": {
+      "get": {
+        "operationId": "listPairs",
+        "summary": "List all active trading pairs",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of pairs",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pairs": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "pairKey": {
+                            "type": "string"
+                          },
+                          "assetA": {
+                            "$ref": "#/components/schemas/Asset"
+                          },
+                          "assetB": {
+                            "$ref": "#/components/schemas/Asset"
+                          },
+                          "latestPrice": {
+                            "type": "number",
+                            "nullable": true
+                          },
+                          "lastUpdated": {
+                            "type": "string",
+                            "format": "date-time",
+                            "nullable": true
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addPair",
+        "summary": "Add a new trading pair (Admin only)",
+        "security": [
+          {
+            "adminAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "assetA": {
+                    "type": "string",
+                    "example": "XLM"
+                  },
+                  "assetB": {
+                    "type": "string",
+                    "example": "USDC:GBBD47..."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Pair added"
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "409": {
+            "description": "Pair already exists"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/price/{assetA}/{assetB}/depth": {
+      "get": {
+        "operationId": "getDepth",
+        "summary": "Get order-book depth and execution slippage for a pair",
+        "description": "Simulates an order of `amount` units of assetA and returns the price ladder plus the execution price and slippage versus the spot price.",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM"
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "USDC"
+          },
+          {
+            "name": "amount",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number",
+              "default": 1000
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Depth ladder",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DepthResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid amount"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "404": {
+            "description": "Pair not watched"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/book/{assetA}/{assetB}": {
+      "get": {
+        "operationId": "getBook",
+        "summary": "Get the aggregated SDEX and AMM price ladder for a pair",
+        "description": "Returns asks and bids as cumulative assetA size at each price. Live SDEX levels are reported as observed; AMM levels are synthetic, fee-adjusted reserve steps. `depth` is a fractional price distance around spot (default 0.1), and `step` is the fraction of each AMM reserve used per synthetic level (default 0.01). Per-venue sample counts, observation times, ages and availability are included.",
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Base asset; use XLM for native Stellar or CODE:ISSUER for a token.",
+            "example": "XLM"
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Quote asset; token issuers must be supplied in full.",
+            "example": "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "description": "Maximum fractional distance from spot; valid range 0 to 0.5.",
+            "schema": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 0.5,
+              "default": 0.1
+            }
+          },
+          {
+            "name": "step",
+            "in": "query",
+            "required": false,
+            "description": "AMM input-reserve fraction per synthetic rung; valid range 0.001 to 0.1.",
+            "schema": {
+              "type": "number",
+              "minimum": 0.001,
+              "maximum": 0.1,
+              "default": 0.01
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Book levels with per-venue provenance; unavailable venues are identified in the response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid asset, depth, or step parameter"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "description": "No source could be read; response provenance identifies failed venues.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BookResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/price/twap/{assetA}/{assetB}": {
+      "get": {
+        "operationId": "getTwap",
+        "summary": "Get a manipulation-resistant time-weighted average price",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "description": "Lookback window in minutes.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1440,
+              "default": 60
+            }
+          },
+          {
+            "name": "sampleInterval",
+            "in": "query",
+            "required": false,
+            "description": "Sampling grid width in seconds.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600,
+              "default": 60
+            }
+          },
+          {
+            "name": "method",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "iqr",
+                "modified_zscore"
+              ],
+              "default": "iqr"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "TWAP result",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TwapResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "TWAP computation failed"
+          }
+        }
+      }
+    },
+    "/price/vwap/{assetA}/{assetB}": {
+      "get": {
+        "operationId": "getVwap",
+        "summary": "Get a volume-weighted average price",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "assetA",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetB",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "description": "Lookback window in minutes.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1440,
+              "default": 60
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "description": "Restrict to a single venue (omitted pools every venue).",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "SDEX",
+                "AMM"
+              ]
+            }
+          },
+          {
+            "name": "method",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "iqr",
+                "modified_zscore"
+              ],
+              "default": "iqr"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "VWAP result",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VwapResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "VWAP computation failed"
+          }
+        }
+      }
+    },
+    "/volumes/{asset}": {
+      "get": {
+        "operationId": "getVolumes",
+        "summary": "Get cross-venue traded volume for an asset",
+        "description": "Sums traded volume for `asset` across every pair and venue it appears in, measured in the asset's own units, with a per-venue breakdown.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM"
+          },
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "24h",
+                "7d",
+                "30d"
+              ],
+              "default": "24h"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated volume",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid window"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "Volume aggregation failed"
+          }
+        }
+      }
+    },
+    "/spreads/{asset}": {
+      "get": {
+        "operationId": "getSpreads",
+        "summary": "Get the tightest per-venue bid/ask spread for an asset",
+        "description": "Reports, for every (venue, pair) that quoted `asset` inside the window, the observed low, high and spread in basis points, tightest first. The spread is the dispersion of recent prints, not a resting order book's top-of-book gap.",
+        "security": [],
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM"
+          },
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "5m",
+                "15m",
+                "1h",
+                "24h"
+              ],
+              "default": "5m"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-venue spreads",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpreadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid window or network"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "Spread aggregation failed"
+          }
+        }
+      }
+    },
+    "/compare/{asset}": {
+      "get": {
+        "operationId": "compareAsset",
+        "summary": "Compare Lens prices with every configured external oracle",
+        "security": [],
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "XLM"
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Price comparison",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompareResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No price data found for the asset"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/screener": {
+      "get": {
+        "operationId": "screenPairs",
+        "summary": "Screen pairs by volume, change, liquidity and price",
+        "security": [],
+        "parameters": [
+          {
+            "name": "volume",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "change_24h_min",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "change_24h_max",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "price_min",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "price_max",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "liquidity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "number"
+            }
+          },
+          {
+            "name": "sortBy",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "volume",
+                "change_24h",
+                "price",
+                "liquidity"
+              ],
+              "default": "volume"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor returned as `nextCursor` by the previous page.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "$ref": "#/components/parameters/NetworkQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Screened pairs",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid filter, sort or cursor"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/benchmark/{asset}": {
+      "get": {
+        "operationId": "getBenchmark",
+        "summary": "Get peg-deviation statistics for an asset against a target",
+        "security": [],
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "USDC"
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "USD"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Benchmark statistics",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BenchmarkResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pair not watched"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "description": "Benchmark computation failed"
+          }
+        }
+      }
+    },
+    "/basket": {
+      "get": {
+        "operationId": "getBasket",
+        "summary": "Compute the weighted price of a basket of assets",
+        "security": [],
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "query",
+            "required": true,
+            "description": "Asset code; repeat for each basket member (at least two).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true,
+            "example": [
+              "XLM",
+              "USDC"
+            ]
+          },
+          {
+            "name": "weight",
+            "in": "query",
+            "required": true,
+            "description": "Relative weight for each `asset`, in the same order.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "style": "form",
+            "explode": true,
+            "example": [
+              0.6,
+              0.4
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Basket price",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BasketResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing assets or mismatched/invalid weights"
+          },
+          "404": {
+            "description": "No price data for one or more assets"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/discovery/resources": {
+      "get": {
+        "operationId": "listDiscoveryResources",
+        "summary": "Browse the x402 Bazaar catalog of discoverable resources",
+        "security": [],
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "http",
+                "mcp"
+              ]
+            }
+          },
+          {
+            "name": "payTo",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "network",
+            "in": "query",
+            "required": false,
+            "description": "Catalog filter matching the resource's payment network. Accepts either the Lens network name (`mainnet`/`testnet`) or the CAIP-2 id (`stellar:pubnet`/`stellar:testnet`).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "extensions",
+            "in": "query",
+            "required": false,
+            "description": "Filter to resources declaring this extension (e.g. `bazaar`).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated catalog page",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/webhooks": {
+      "post": {
+        "operationId": "createWebhook",
+        "summary": "Subscribe to a price-threshold webhook",
+        "description": "Registers an HTTPS endpoint to be called when the pair's price crosses `threshold` in the given `direction`. The response contains the signing secret exactly once.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "url",
+                  "assetA",
+                  "assetB",
+                  "threshold",
+                  "direction"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "HTTPS endpoint to deliver events to."
+                  },
+                  "assetA": {
+                    "type": "string",
+                    "example": "XLM"
+                  },
+                  "assetB": {
+                    "type": "string",
+                    "example": "USDC"
+                  },
+                  "threshold": {
+                    "type": "number"
+                  },
+                  "direction": {
+                    "type": "string",
+                    "enum": [
+                      "above",
+                      "below"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Webhook created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookCreatedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid webhook definition"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/webhooks/{id}": {
+      "delete": {
+        "operationId": "deleteWebhook",
+        "summary": "Delete a webhook subscription",
+        "security": [],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Webhook deleted (idempotent — a missing id also returns 204)"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/usage/me": {
+      "get": {
+        "operationId": "getMyUsage",
+        "summary": "Get usage and quota for the calling API key",
+        "security": [
+          {
+            "apiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Usage summary for the authenticated key",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/supported": {
+      "get": {
+        "operationId": "getSupported",
+        "summary": "List the payment kinds and extensions this facilitator supports",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Supported payment kinds and extensions",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupportedResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/verify": {
+      "post": {
+        "operationId": "verifyPayment",
+        "summary": "Verify an x402 payment payload",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed request or invalid payment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal verification error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settle": {
+      "post": {
+        "operationId": "settlePayment",
+        "summary": "Settle an x402 payment (idempotent)",
+        "description": "Submits the payment transaction and records the attempt keyed on its transaction hash. Retrying the same payload replays the stored answer instead of paying twice.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settlement result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettleResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/graphql": {
+      "get": {
+        "operationId": "graphqlGet",
+        "summary": "Execute a GraphQL query over HTTP GET",
+        "security": [],
+        "parameters": [
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "variables",
+            "in": "query",
+            "required": false,
+            "description": "JSON-encoded variables object.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "operationName",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "GraphQL result",
+            "headers": {
+              "Cache-Control": {
+                "$ref": "#/components/headers/CacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphQlResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "graphqlPost",
+        "summary": "Execute a GraphQL query, mutation or subscription handshake",
+        "security": [
+          {
+            "x402": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "query"
+                ],
+                "properties": {
+                  "query": {
+                    "type": "string"
+                  },
+                  "variables": {
+                    "type": "object"
+                  },
+                  "operationName": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "GraphQL result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphQlResponse"
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "x402": {
+        "type": "apiKey",
+        "name": "X-PAYMENT",
+        "in": "header",
+        "description": "Base64 encoded JSON payment proof for x402 micropayments."
+      },
+      "adminAuth": {
+        "type": "apiKey",
+        "name": "X-Admin-Key",
+        "in": "header"
+      },
+      "apiKeyAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Client API key issued through the admin API, sent as `Authorization: Bearer <key>`."
+      }
+    },
+    "parameters": {
+      "NetworkQuery": {
+        "name": "network",
+        "in": "query",
+        "required": false,
+        "description": "Stellar network to answer for — `testnet` or `mainnet`. Defaults to this instance's configured `STELLAR_NETWORK`. An unrecognised value is rejected with 400. DB-backed reads are currently served from whichever network this instance indexes, even when another is requested.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "testnet",
+            "mainnet"
+          ],
+          "default": "testnet"
+        }
+      }
+    },
+    "responses": {
+      "PaymentRequired": {
+        "description": "Payment Required",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "x402Version": {
+                  "type": "integer"
+                },
+                "accepts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "scheme": {
+                        "type": "string"
+                      },
+                      "price": {
+                        "type": "string"
+                      },
+                      "network": {
+                        "type": "string"
+                      },
+                      "payTo": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "error": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Rate limit exceeded",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Seconds to wait before retrying"
+          },
+          "X-RateLimit-Remaining": {
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Remaining requests in current window"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "statusCode": {
+                  "type": "integer"
+                },
+                "error": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "retryAfter": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "headers": {
+      "CacheControl": {
+        "description": "Per-route cache policy (see \"Cache policy\" in the API description). Every route sends a deliberate `Cache-Control`: live prices `public, max-age=30`; aggregates `public, max-age=60`; `/pairs` and `/pools` `public, max-age=300`; closed candle windows `public, max-age=86400`; per-caller, operator and error responses `no-store`.",
+        "schema": {
+          "type": "string",
+          "example": "public, max-age=300"
+        }
+      }
+    },
+    "schemas": {
+      "DependencyCheck": {
+        "type": "object",
+        "description": "Result of one dependency probe. `reason` is a fixed phrase, never the raw error: connection errors carry the host and port and this is a public endpoint.",
+        "required": [
+          "status",
+          "latencyMs",
+          "reason"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "skipped"
+            ]
+          },
+          "latencyMs": {
+            "type": "integer",
+            "description": "Round-trip time of the probe."
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "example": "unreachable or not migrated"
+          }
+        }
+      },
+      "ReadinessReport": {
+        "type": "object",
+        "description": "Readiness of one instance. Identical on 200 and 503; `ok` and the HTTP status together say whether traffic should be routed here.",
+        "required": [
+          "ok",
+          "booted",
+          "checks",
+          "checkedAt"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "description": "True only when boot finished and every checked dependency is up."
+          },
+          "booted": {
+            "type": "boolean",
+            "description": "False while the boot sequence is still running."
+          },
+          "checks": {
+            "type": "object",
+            "required": [
+              "postgres",
+              "redis"
+            ],
+            "properties": {
+              "postgres": {
+                "$ref": "#/components/schemas/DependencyCheck"
+              },
+              "redis": {
+                "$ref": "#/components/schemas/DependencyCheck"
+              }
+            }
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the underlying probes ran (answers may be briefly cached)."
+          }
+        }
+      },
+      "Asset": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotAsset": {
+        "type": "object",
+        "description": "A Stellar asset. The issuer is kept because a code such as USDC names a different asset per issuer; `issuer` is null only for the native asset.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotVenue": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "orderbook",
+              "amm",
+              "unknown"
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "reporting",
+              "stale",
+              "silent",
+              "disabled"
+            ]
+          },
+          "samples": {
+            "type": "integer"
+          },
+          "samples24h": {
+            "type": "integer"
+          },
+          "pairs24h": {
+            "type": "integer"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "ageSeconds": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotPool": {
+        "type": "object",
+        "properties": {
+          "poolId": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string",
+            "nullable": true
+          },
+          "assetA": {
+            "$ref": "#/components/schemas/SnapshotAsset"
+          },
+          "assetB": {
+            "$ref": "#/components/schemas/SnapshotAsset"
+          },
+          "reserveA": {
+            "type": "number",
+            "nullable": true
+          },
+          "reserveB": {
+            "type": "number",
+            "nullable": true
+          },
+          "spotPrice": {
+            "type": "number",
+            "nullable": true
+          },
+          "feeBp": {
+            "type": "integer",
+            "nullable": true
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "ageSeconds": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotVolume": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "nullable": true
+          },
+          "unit": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SnapshotAsset"
+              }
+            ],
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotTopPair": {
+        "type": "object",
+        "properties": {
+          "pairKey": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean",
+            "description": "Whether the pair is in this network's watched-pair config. When false the asset order (and therefore the price direction) is taken from the alphabetically-sorted pair key."
+          },
+          "assetA": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SnapshotAsset"
+              }
+            ]
+          },
+          "assetB": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SnapshotAsset"
+              }
+            ]
+          },
+          "price": {
+            "type": "number",
+            "nullable": true,
+            "description": "Stored as assetB-per-assetA in the config's order."
+          },
+          "baseVolume24h": {
+            "type": "number"
+          },
+          "counterVolume24h": {
+            "type": "number"
+          },
+          "samples24h": {
+            "type": "integer"
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "ageSeconds": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotPeg": {
+        "type": "object",
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/SnapshotAsset"
+          },
+          "target": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "quote": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SnapshotAsset"
+              }
+            ]
+          },
+          "price": {
+            "type": "number",
+            "nullable": true,
+            "description": "The pegged asset's price in its quote asset."
+          },
+          "deviationBp": {
+            "type": "number",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "on_peg",
+              "off_peg",
+              "no_reference",
+              "no_data"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          },
+          "samples24h": {
+            "type": "integer"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "SnapshotResponse": {
+        "type": "object",
+        "properties": {
+          "network": {
+            "type": "string",
+            "enum": [
+              "testnet",
+              "mainnet"
+            ]
+          },
+          "asOf": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The single instant (from one database statement) every window and age is measured from."
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "24h"
+            ]
+          },
+          "cache": {
+            "type": "object",
+            "properties": {
+              "ttlSeconds": {
+                "type": "integer"
+              },
+              "maxAgeSeconds": {
+                "type": "integer"
+              },
+              "hit": {
+                "type": "boolean"
+              },
+              "storedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "ageSeconds": {
+                "type": "integer",
+                "nullable": true
+              }
+            }
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotVenue"
+            }
+          },
+          "tvl": {
+            "type": "object",
+            "properties": {
+              "note": {
+                "type": "string"
+              },
+              "poolCount": {
+                "type": "integer"
+              },
+              "sampleCount": {
+                "type": "integer"
+              },
+              "lastUpdated": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "ageSeconds": {
+                "type": "integer",
+                "nullable": true
+              },
+              "stale": {
+                "type": "boolean"
+              },
+              "byAsset": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "asset": {
+                      "$ref": "#/components/schemas/SnapshotAsset"
+                    },
+                    "amount": {
+                      "type": "number"
+                    },
+                    "pools": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              },
+              "pools": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SnapshotPool"
+                }
+              }
+            }
+          },
+          "volume24h": {
+            "type": "object",
+            "properties": {
+              "window": {
+                "type": "string",
+                "enum": [
+                  "24h"
+                ]
+              },
+              "sampleCount": {
+                "type": "integer"
+              },
+              "byVenue": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "venue": {
+                      "type": "string"
+                    },
+                    "baseVolume": {
+                      "type": "number"
+                    },
+                    "counterVolume": {
+                      "type": "number"
+                    },
+                    "samples": {
+                      "type": "integer"
+                    },
+                    "pairs": {
+                      "type": "integer"
+                    },
+                    "lastUpdated": {
+                      "type": "string",
+                      "format": "date-time",
+                      "nullable": true
+                    },
+                    "ageSeconds": {
+                      "type": "integer",
+                      "nullable": true
+                    }
+                  }
+                }
+              },
+              "total": {
+                "$ref": "#/components/schemas/SnapshotVolume"
+              }
+            }
+          },
+          "topPairs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotTopPair"
+            }
+          },
+          "pegs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotPeg"
+            }
+          },
+          "freshness": {
+            "type": "object",
+            "properties": {
+              "asOf": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "windowStart": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "windowEnd": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "lastUpdated": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "ageSeconds": {
+                "type": "integer",
+                "nullable": true
+              },
+              "staleAfterSeconds": {
+                "type": "integer"
+              },
+              "stale": {
+                "type": "boolean"
+              },
+              "venuesReporting": {
+                "type": "integer"
+              },
+              "venuesExpected": {
+                "type": "integer"
+              },
+              "venuesSilent": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "AggregatedPrice": {
+        "type": "object",
+        "properties": {
+          "assetA": {
+            "type": "string"
+          },
+          "assetB": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "price": {
+            "type": "number"
+          },
+          "sdexPrice": {
+            "type": "number"
+          },
+          "ammPrice": {
+            "type": "number"
+          },
+          "bestRoute": {
+            "type": "string",
+            "enum": [
+              "SDEX",
+              "AMM",
+              "SPLIT",
+              "UNKNOWN"
+            ]
+          },
+          "volume24h": {
+            "type": "number"
+          },
+          "sdexVolume24h": {
+            "type": "number"
+          },
+          "ammVolume24h": {
+            "type": "number"
+          },
+          "vwap1m": {
+            "type": "number"
+          },
+          "vwap5m": {
+            "type": "number"
+          },
+          "vwap1h": {
+            "type": "number"
+          },
+          "vwap24h": {
+            "type": "number"
+          },
+          "priceChange24h": {
+            "type": "number"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sources": {
+            "type": "integer"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low",
+              "unknown"
+            ]
+          },
+          "lastTradeAgeSeconds": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "RouteInfo": {
+        "type": "object",
+        "properties": {
+          "route": {
+            "type": "string",
+            "enum": [
+              "SDEX",
+              "AMM",
+              "SPLIT",
+              "UNKNOWN"
+            ]
+          },
+          "sdexPrice": {
+            "type": "number"
+          },
+          "ammPrice": {
+            "type": "number"
+          },
+          "estimatedOutput": {
+            "type": "number"
+          },
+          "slippagePct": {
+            "type": "number"
+          },
+          "recommendation": {
+            "type": "string"
+          }
+        }
+      },
+      "PriceBucket": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window": {
+            "type": "string"
+          },
+          "vwap": {
+            "type": "number"
+          },
+          "sdexVwap": {
+            "type": "number",
+            "nullable": true
+          },
+          "ammVwap": {
+            "type": "number",
+            "nullable": true
+          },
+          "volume": {
+            "type": "number"
+          },
+          "tradeCount": {
+            "type": "integer"
+          },
+          "open": {
+            "type": "number",
+            "nullable": true
+          },
+          "close": {
+            "type": "number",
+            "nullable": true
+          },
+          "high": {
+            "type": "number",
+            "nullable": true
+          },
+          "low": {
+            "type": "number",
+            "nullable": true
+          }
+        }
+      },
+      "PriceLevel": {
+        "type": "object",
+        "required": [
+          "price",
+          "size"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "price": {
+            "type": "number"
+          },
+          "size": {
+            "type": "number"
+          }
+        }
+      },
+      "DepthResponse": {
+        "type": "object",
+        "required": [
+          "assetA",
+          "assetB",
+          "pairKey",
+          "spotPrice",
+          "executionPrice",
+          "slippagePct",
+          "asks",
+          "bids",
+          "source"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "assetA": {
+            "type": "string"
+          },
+          "assetB": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "spotPrice": {
+            "type": "number"
+          },
+          "executionPrice": {
+            "type": "number"
+          },
+          "slippagePct": {
+            "type": "number"
+          },
+          "asks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PriceLevel"
+            }
+          },
+          "bids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PriceLevel"
+            }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "AMM",
+              "SDEX",
+              "BOTH"
+            ]
+          }
+        }
+      },
+      "BookLevel": {
+        "type": "object",
+        "required": [
+          "price",
+          "size",
+          "cumulativeSize",
+          "venues",
+          "synthetic",
+          "sampleCount"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "price": {
+            "type": "number",
+            "description": "Quote-asset units per base-asset unit."
+          },
+          "size": {
+            "type": "number",
+            "description": "Base-asset size at this level."
+          },
+          "cumulativeSize": {
+            "type": "number",
+            "description": "Base-asset size from the best price through this level, independently for asks and bids."
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "SDEX for order-book levels or AMM:{poolId} for each contributing pool."
+          },
+          "synthetic": {
+            "type": "boolean",
+            "description": "True for reserve-derived AMM steps; false for observed SDEX book levels."
+          },
+          "sampleCount": {
+            "type": "integer",
+            "description": "Number of source levels combined at this price."
+          }
+        }
+      },
+      "BookSource": {
+        "type": "object",
+        "required": [
+          "venue",
+          "status",
+          "sampleCount",
+          "observedAt",
+          "dataAgeSeconds",
+          "truncated"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "venue": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "no_liquidity",
+              "unavailable"
+            ]
+          },
+          "sampleCount": {
+            "type": "integer",
+            "description": "SDEX book levels returned, or latest AMM pool snapshots used."
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "dataAgeSeconds": {
+            "type": "number",
+            "nullable": true
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the SDEX response reached the 200-level per-side request limit."
+          }
+        }
+      },
+      "BookResponse": {
+        "type": "object",
+        "required": [
+          "assetA",
+          "assetB",
+          "pairKey",
+          "network",
+          "spotPrice",
+          "spotSource",
+          "depth",
+          "step",
+          "status",
+          "asks",
+          "bids",
+          "provenance"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "assetA": {
+            "type": "string"
+          },
+          "assetB": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "testnet",
+              "mainnet"
+            ]
+          },
+          "spotPrice": {
+            "type": "number",
+            "nullable": true
+          },
+          "spotSource": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "SDEX_MID",
+              "SDEX_ASK",
+              "SDEX_BID",
+              "AMM_RESERVES",
+              null
+            ]
+          },
+          "depth": {
+            "type": "number"
+          },
+          "step": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "no_liquidity",
+              "no_levels_in_range",
+              "unavailable"
+            ]
+          },
+          "asks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BookLevel"
+            }
+          },
+          "bids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BookLevel"
+            }
+          },
+          "provenance": {
+            "type": "object",
+            "required": [
+              "sampledAt",
+              "sampleCount",
+              "venues"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "sampledAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "sampleCount": {
+                "type": "integer"
+              },
+              "venues": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/BookSource"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TwapResponse": {
+        "type": "object",
+        "required": [
+          "assetA",
+          "assetB",
+          "pairKey",
+          "network",
+          "twap",
+          "windowMinutes",
+          "sampleIntervalSeconds",
+          "startTime",
+          "endTime",
+          "sampleCount",
+          "outlierRejected",
+          "filterMethod"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "assetA": {
+            "type": "string"
+          },
+          "assetB": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "testnet",
+              "mainnet"
+            ]
+          },
+          "twap": {
+            "type": "number"
+          },
+          "windowMinutes": {
+            "type": "integer"
+          },
+          "sampleIntervalSeconds": {
+            "type": "integer"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sampleCount": {
+            "type": "integer"
+          },
+          "outlierRejected": {
+            "type": "integer"
+          },
+          "filterMethod": {
+            "type": "string",
+            "enum": [
+              "iqr",
+              "modified_zscore"
+            ]
+          }
+        }
+      },
+      "VwapResponse": {
+        "type": "object",
+        "required": [
+          "assetA",
+          "assetB",
+          "pairKey",
+          "vwap",
+          "windowMinutes",
+          "source",
+          "startTime",
+          "endTime",
+          "sampleCount",
+          "volumeTotal",
+          "outlierRejected",
+          "filterMethod"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "assetA": {
+            "type": "string"
+          },
+          "assetB": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "vwap": {
+            "type": "number"
+          },
+          "windowMinutes": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sampleCount": {
+            "type": "integer"
+          },
+          "volumeTotal": {
+            "type": "number"
+          },
+          "outlierRejected": {
+            "type": "integer"
+          },
+          "filterMethod": {
+            "type": "string",
+            "enum": [
+              "iqr",
+              "modified_zscore"
+            ]
+          }
+        }
+      },
+      "VolumeResponse": {
+        "type": "object",
+        "required": [
+          "asset",
+          "window",
+          "startTime",
+          "endTime",
+          "totalVolume",
+          "byVenue",
+          "venues",
+          "tradeCount"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "24h",
+              "7d",
+              "30d"
+            ]
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "totalVolume": {
+            "type": "number"
+          },
+          "byVenue": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tradeCount": {
+            "type": "integer"
+          }
+        }
+      },
+      "SpreadVenue": {
+        "type": "object",
+        "required": [
+          "venue",
+          "pairKey",
+          "bid",
+          "ask",
+          "mid",
+          "spreadBps",
+          "observations",
+          "lastSeen"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "venue": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "bid": {
+            "type": "number"
+          },
+          "ask": {
+            "type": "number"
+          },
+          "mid": {
+            "type": "number"
+          },
+          "spreadBps": {
+            "type": "number"
+          },
+          "observations": {
+            "type": "integer"
+          },
+          "lastSeen": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SpreadResponse": {
+        "type": "object",
+        "required": [
+          "asset",
+          "network",
+          "window",
+          "startTime",
+          "endTime",
+          "venues",
+          "tightest"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "testnet",
+              "mainnet"
+            ]
+          },
+          "window": {
+            "type": "string",
+            "enum": [
+              "5m",
+              "15m",
+              "1h",
+              "24h"
+            ]
+          },
+          "startTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpreadVenue"
+            }
+          },
+          "tightest": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SpreadVenue"
+              }
+            ]
+          }
+        }
+      },
+      "CompareResponse": {
+        "type": "object",
+        "required": [
+          "asset",
+          "network",
+          "lens",
+          "reflector",
+          "deviationPct",
+          "status",
+          "fetchedAt",
+          "oracles"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "testnet",
+              "mainnet"
+            ]
+          },
+          "lens": {
+            "type": "number",
+            "nullable": true
+          },
+          "reflector": {
+            "type": "number",
+            "nullable": true
+          },
+          "deviationPct": {
+            "type": "number",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "aligned",
+              "minor_deviation",
+              "major_deviation",
+              "partial"
+            ]
+          },
+          "fetchedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "oracles": {
+            "type": "array",
+            "description": "One result per configured adapter; unavailable sources remain present with a status.",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "price",
+                "timestamp",
+                "deviationPct",
+                "status",
+                "ageSeconds"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "number",
+                  "nullable": true
+                },
+                "timestamp": {
+                  "type": "string",
+                  "format": "date-time",
+                  "nullable": true
+                },
+                "deviationPct": {
+                  "type": "number",
+                  "nullable": true
+                },
+                "status": {
+                  "type": "string",
+                  "description": "unreachable means the adapter failed; empty means it is configured but returned no quote.",
+                  "enum": [
+                    "available",
+                    "unreachable",
+                    "empty",
+                    "not_configured"
+                  ]
+                },
+                "ageSeconds": {
+                  "type": "integer",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "ScreenerRow": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "pair_key": {
+            "type": "string"
+          },
+          "volume": {
+            "type": "number"
+          },
+          "price": {
+            "type": "number"
+          },
+          "change_24h": {
+            "type": "number"
+          },
+          "liquidity": {
+            "type": "number"
+          }
+        }
+      },
+      "ScreenerResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "nextCursor",
+          "hasMore",
+          "total"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScreenerRow"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "total": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "BenchmarkResponse": {
+        "type": "object",
+        "required": [
+          "asset",
+          "target",
+          "pairKey",
+          "currentPrice",
+          "currentDeviationBp",
+          "rolling24h"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "pairKey": {
+            "type": "string"
+          },
+          "currentPrice": {
+            "type": "number",
+            "nullable": true
+          },
+          "currentDeviationBp": {
+            "type": "number",
+            "nullable": true
+          },
+          "rolling24h": {
+            "type": "object",
+            "required": [
+              "maxDeviationBp",
+              "minDeviationBp",
+              "maxAbsoluteDeviationBp",
+              "averageDeviationBp",
+              "sampleCount"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "maxDeviationBp": {
+                "type": "number",
+                "nullable": true
+              },
+              "minDeviationBp": {
+                "type": "number",
+                "nullable": true
+              },
+              "maxAbsoluteDeviationBp": {
+                "type": "number",
+                "nullable": true
+              },
+              "averageDeviationBp": {
+                "type": "number",
+                "nullable": true
+              },
+              "sampleCount": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "BasketResponse": {
+        "type": "object",
+        "required": [
+          "basketPrice",
+          "components",
+          "weightSum",
+          "computedAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "basketPrice": {
+            "type": "number"
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "asset",
+                "price",
+                "weight",
+                "contribution"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "asset": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "number"
+                },
+                "weight": {
+                  "type": "number"
+                },
+                "contribution": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "weightSum": {
+            "type": "number"
+          },
+          "computedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "DiscoveryResource": {
+        "type": "object",
+        "properties": {
+          "resource": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": "string"
+              },
+              "serviceName": {
+                "type": "string"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "iconUrl": {
+                "type": "string"
+              }
+            }
+          },
+          "accepts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "scheme": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "string"
+                },
+                "network": {
+                  "type": "string"
+                },
+                "payTo": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "extensions": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "DiscoveryResponse": {
+        "type": "object",
+        "required": [
+          "resources",
+          "limit",
+          "offset",
+          "total"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "resources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveryResource"
+            }
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          }
+        }
+      },
+      "WebhookCreatedResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "secret"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "string"
+          }
+        }
+      },
+      "UsageResponse": {
+        "type": "object",
+        "required": [
+          "keyId",
+          "dailyCalls",
+          "dailyCents",
+          "monthlyCalls",
+          "monthlyCents",
+          "dailyQuotaCents",
+          "monthlyQuotaCents",
+          "dailyRemainingCents",
+          "monthlyRemainingCents",
+          "overagePolicy",
+          "quotaExceeded"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "keyId": {
+            "type": "string"
+          },
+          "dailyCalls": {
+            "type": "integer"
+          },
+          "dailyCents": {
+            "type": "integer"
+          },
+          "monthlyCalls": {
+            "type": "integer"
+          },
+          "monthlyCents": {
+            "type": "integer"
+          },
+          "dailyQuotaCents": {
+            "type": "integer"
+          },
+          "monthlyQuotaCents": {
+            "type": "integer"
+          },
+          "dailyRemainingCents": {
+            "type": "integer"
+          },
+          "monthlyRemainingCents": {
+            "type": "integer"
+          },
+          "overagePolicy": {
+            "type": "string",
+            "enum": [
+              "block",
+              "charge_402",
+              "allow_overage"
+            ]
+          },
+          "quotaExceeded": {
+            "type": "boolean"
+          }
+        }
+      },
+      "VerifyRequest": {
+        "type": "object",
+        "required": [
+          "paymentPayload",
+          "paymentRequirements"
+        ],
+        "properties": {
+          "x402Version": {
+            "type": "integer"
+          },
+          "paymentPayload": {
+            "type": "object"
+          },
+          "paymentRequirements": {
+            "type": "object"
+          }
+        }
+      },
+      "VerifyResponse": {
+        "type": "object",
+        "required": [
+          "isValid"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "isValid": {
+            "type": "boolean"
+          },
+          "invalidReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "invalidMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "payer": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "SettleRequest": {
+        "type": "object",
+        "required": [
+          "paymentPayload",
+          "paymentRequirements"
+        ],
+        "properties": {
+          "x402Version": {
+            "type": "integer"
+          },
+          "paymentPayload": {
+            "type": "object"
+          },
+          "paymentRequirements": {
+            "type": "object"
+          }
+        }
+      },
+      "SettleResponse": {
+        "type": "object",
+        "required": [
+          "success",
+          "transaction",
+          "network"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "errorReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "errorMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "transaction": {
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          }
+        }
+      },
+      "SupportedResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "kinds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "scheme": {
+                  "type": "string"
+                },
+                "network": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "extensions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "GraphQlResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "data": {
+            "type": "object",
+            "nullable": true
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
